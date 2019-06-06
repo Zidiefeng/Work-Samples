@@ -1,0 +1,902 @@
+---
+title: "group_project"
+author: "Team 17"
+date: "April 1, 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set
+```
+
+
+## Load library
+```{r}
+rm(list=ls())
+installIfAbsentAndLoad <- function(neededVector) {
+  for(thispackage in neededVector) {
+    if( ! require(thispackage, character.only = T) )
+    { install.packages(thispackage)}
+    require(thispackage, character.only = T)
+  }
+}
+needed  <-  c('feather','dplyr','ggplot2','glmnet','randomForest','pROC','verification', 'scales', 'ada', 'e1071', 'ISLR','rpart','rattle','C50')
+installIfAbsentAndLoad(needed)
+
+```
+
+# Define functions
+```{r}
+#function for scale
+scale_function <- function(x){(x-min(x))/(max(x)-min(x))}
+
+#function for calculate auc
+my.auc <- function(actual, pred.prob){
+        score <- roc.area(as.integer(as.factor(actual))-1, pred.prob)
+        return(score)
+}
+
+#function for plotting ROC
+my.rocPlot <- function(actual, pred.prob,auc, title){
+        roc.plot(as.integer(as.factor(actual))-1, pred.prob, main="")
+        legend("bottomright", bty="n",
+               sprintf("Area Under the Curve (AUC) = %1.3f", auc$A))
+        title(main = title,
+              sub = paste("David Murray", format(Sys.time(), "%Y-%b-%d %H:%M:%S"), Sys.info()["user"]))
+}
+
+#function to calculate type I, type II error
+my.typeErr <- function(table){
+        print(c("Type I Error:", percent(table[1,2] / (table[1,2] + table[1,1]), 0.01)))
+        print(c("Type II Error:", percent(table[2,1] / (table[2,1] + table[2,2]), 0.01)))
+}
+```
+
+## Load data from 2 data files
+```{r}
+# we have two data files: 
+# data file 1: 'Fraud_Data.csv' shows the transactions 
+# data file 2: 'IpAddress_to_Country.csv' shows the relationship between the IP address and the corresponding countries
+
+#load and view data from data file 1
+dataset <- read.csv("Fraud_Data.csv")
+dataset <- na.omit(dataset)
+str(dataset)
+
+#deal with date & time data.
+dataset$signup_time <- as.Date(dataset$signup_time)
+dataset$purchase_time <- as.Date(dataset$purchase_time)
+head(dataset)
+
+#load and view data from data file 2
+address2country <- read.csv('IpAddress_to_Country.csv',stringsAsFactors = FALSE)
+head(address2country)
+dim(address2country)
+```
+
+## Join those two data files into one dataset and save it as "data.csv"
+```{r}
+#map country names from dataset 2("adress2country") to dataset 1("dataset")
+countries <-c()
+for (i in 1:dim(dataset)[1]){
+    ip_address <- dataset$ip_address[i]
+    tmp <- address2country[(address2country$lower_bound_ip_address<=ip_address)& (address2country$upper_bound_ip_address>=ip_address),]$country
+    if (length(tmp)==1){
+        countries[i] <- tmp
+    }else{
+        countries[i]='NA'
+    }
+}
+dataset['country']=countries
+write_feather(dataset, 'data.csv')
+data_raw <- read_feather('data.csv')
+head(data_raw)
+
+```
+
+# feature engineering 1: transform datetime data
+```{r}
+# Calculate the time difference between purchase time and signup time
+# since it's suspicious if they purchase immediately after signup
+time_diff = difftime(data_raw$purchase_time, data_raw$signup_time, units="secs")
+data_raw$time_diff = as.numeric(time_diff)
+head(data_raw)
+data_raw <- na.omit(data_raw) #remove NAs
+data <- data.frame(data_raw)
+
+#Transform "YYYY-MM-DD" to day, month, quarter
+data<-within(data_raw,{
+  signup_day<-weekdays(signup_time)
+  signup_month = months(signup_time) 
+  signup_quarter = quarters(signup_time)
+  purchase_day = weekdays(purchase_time)
+  purchase_month = months(purchase_time)
+  purchase_quarter= quarters(purchase_time)
+})
+head(data)
+```
+
+
+
+
+
+
+# feature engineering 2: 
+# transform "device number"", “ip_num”, “country” data to "n_shared_device", "n_shared_ip", "n_shared_country"
+
+```{r}
+# group and count how many devices, ip_address and countries are shared by ‘first-time’ transactions
+# use the number of shares rather than the original columns 
+# since the original columns have too many categories and cannot provide meaningful information 
+head(data)
+devices_num <- group_by(data,device_id) %>% summarise(n_shared_device=n())
+data <- merge(data,devices_num,by='device_id')
+data$ip_address <- as.factor(data$ip_address)
+ips_num <- group_by(data,ip_address) %>% summarise(n_shared_ip=n())
+data <- merge(data,ips_num,by='ip_address')
+country_num <- group_by(data,country) %>% summarise(n_shared_country=n())
+data <- merge(data,country_num,by='country')
+str(data)
+
+```
+
+# Save feature-enginered data to "data.feather"
+```{r}
+write_feather(data,'data.feather')
+data <- read_feather('data.feather')
+```
+
+# Initial data visualizaion/exploration
+```{r}
+#variables
+data %>%
+  dplyr::select(class) %>%
+  dplyr::group_by(class) %>%
+  dplyr::summarise(count = n()) %>%
+  glimpse
+data$class <- as.factor(data$class)
+str(data)
+
+#view the target (fraud-1/not fraud-0)
+col <-  c("red4", "blue4")
+data %>%
+  group_by(class) %>%
+  summarise(n=n()) %>%
+  mutate(percentage=n/sum(n)) %>%
+  ggplot(aes(x=as.factor(class),y=n)) +
+  geom_bar(stat = 'identity',fill=col)+
+  geom_text(aes(label=paste(round(percentage*100,2),'%')),vjust=-0.5)+
+  theme_minimal()+
+  labs(x='target',y='count')
+
+
+#view the target against gender
+data %>% 
+  group_by(class,sex) %>%
+  summarise(n=n()) %>%
+  mutate(percentage=n/sum(n)) %>%
+  ggplot(aes(x=as.factor(class),fill=sex,y=n)) +
+  geom_bar(position="dodge", stat="identity")+
+  geom_text(aes(label=paste(round(percentage*100,2),'%')),position =  position_dodge(0.9)
+            ,vjust =-0.5)+
+  theme_minimal()+
+  labs(x='target',y='count')
+
+#view the target against age
+data %>% 
+  group_by(class) %>%
+  summarise(age=mean(age)) %>%
+  ggplot(aes(fill=col,x=as.factor(class),y=age)) +
+  geom_bar(position="dodge", stat="identity")+
+  geom_text(aes(label=paste(round(age,2))),position =  position_dodge(0.9)
+            ,vjust =-0.5)+
+  theme_minimal()+
+  labs(x='class',y='age')
+
+#view the target against marketing sources
+data %>% 
+  group_by(class,source) %>%
+  summarise(n=n()) %>%
+  mutate(percentage=n/sum(n)) %>%
+  ggplot(aes(x=as.factor(class),fill=source,y=n)) +
+  geom_bar(position="dodge", stat="identity")+
+  geom_text(aes(label=paste(round(percentage*100,2),'%')),position =  position_dodge(0.9)
+            ,vjust =-0.5)+
+  theme_minimal()+
+  labs(x='target',y='count')
+```
+
+# split dataset for modeling
+```{r}
+# final step of cleaning data: delete redundant columns and transform categorical data into factors
+cleaned_data <- na.omit(data[,c(-1,-2,-3,-4,-5,-6)])
+cleaned_data <- mutate_if(cleaned_data, is.character, as.factor) 
+cleaned_data$class<- as.factor(cleaned_data$class)
+
+
+#divide into training set 80% and testing set 20%
+set.seed(17)
+train_line1 <- sample(1:nrow(cleaned_data), nrow(cleaned_data)*0.8)
+test_line1 <- (-train_line1)
+
+
+#for categorical decision tree, random forest
+train_set_80<- cleaned_data[train_line1,] 
+test_set_20 <- cleaned_data[test_line1,] 
+
+
+# for logistic regression
+onehot_x <- model.matrix(class~., cleaned_data)[,-1] #onehot encoding
+scaled_x <- apply(onehot_x,MARGIN = 2,FUN = scale_function) #scale
+y <- as.numeric(cleaned_data$class)-1 
+train_x_80<- scaled_x[train_line1,] 
+train_y_80<- y[train_line1] 
+test_x_20 <- scaled_x[test_line1,] 
+test_y_20 <- y[test_line1] 
+
+
+
+#for stacking
+#divide into training set 40%, validation set 40%, and testing set 20%
+
+# for random forest
+train_line2 <- sample(1:nrow(train_set_80),nrow(train_set_80)*0.5)
+train_set_40 <- train_set_80[train_line2,]
+val_set_40 <- train_set_80[-train_line2,]
+# write_feather(train_set_40,'stackingTrain.feather')
+# write_feather(val_set_40,'stackingVal.feather')
+# write_feather(test_set_20,'stackingTest.feather')
+
+# logistic regression
+train_x_40 <- train_x_80[train_line2,]
+train_y_40 <- train_y_80[train_line2]
+val_x_40 <- train_x_80[-train_line2,]
+val_y_40 <- train_y_80[-train_line2]
+
+
+
+
+```
+
+
+
+# logistic regression with lasso
+```{r}
+#logistic regression under lasso
+set.seed(17)
+grid <- 10 ^ seq(10, -10, length=100)
+lasso.mod <- cv.glmnet(train_x_80,train_y_80,alpha=1,lambda=grid, family = 'binomial')
+plot(lasso.mod)
+lambda_best <- lasso.mod$lambda.1se
+prob_pred_lasso  <- predict(lasso.mod,s=lambda_best, test_x_20, type = 'response')
+
+# 0.5 cutoff point
+class_pred_lasso <- ifelse(lasso.pred>0.5,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso))
+lasso.auc <- my.auc(test_y_20, prob_pred_lasso)
+print(lasso.auc)
+ggplot(data.frame(prob_pred_lasso), aes(x = prob_pred_lasso)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+my.rocPlot(test_y_20, prob_pred_lasso, lasso.auc, "Lasso ROC Curve")
+print(paste('roc score is:',(round(roc.area(as.numeric(test_y_20), as.numeric(lasso.pred))$'A',3))))
+# sum(lasso.pred>0.3 & lasso.pred<0.7) #unsure number of transactions
+
+
+#0.1 cutoff point
+class_pred_lasso.1 <- ifelse(lasso.pred>0.1,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso.1==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.1, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.1))
+
+
+#0.15 cutoff point
+class_pred_lasso.15 <- ifelse(lasso.pred>0.15,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso.15==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.15, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.15))
+
+
+#0.2 cutoff point
+class_pred_lasso.2 <- ifelse(lasso.pred>0.2,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso.2==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.2, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.2))
+
+
+#0.3 cutoff point
+class_pred_lasso.3 <- ifelse(lasso.pred>0.3,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso.3==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.3, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.3))
+
+
+#0.4 cutoff point
+class_pred_lasso.4 <- ifelse(lasso.pred>0.4,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso.4==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.4, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.4))
+
+#0.05 cutoff point
+class_pred_lasso..5 <- ifelse(lasso.pred>0.04,1,0)
+print(paste('acc for lasso is:',round(mean(class_pred_lasso..5==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso..5, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso..5))
+
+```
+
+# randomforest
+```{r}
+# quick random forest
+set.seed(17)
+
+#find best mtry
+oob.err<-rep(0,8)
+min.ntree<-rep(0,8)
+accuracy<-rep(0,8)
+for(mtry in 1:8){
+  rf_mtry <- randomForest(formula=class ~ .,data=train_set_80, ntree=400, mtry=mtry,
+                          importance=TRUE,localImp=TRUE,na.action=na.roughfix,replace=TRUE)
+  accuracy[mtry]=1-rf_mtry$err.rate[which(rf_mtry$err.rate[,"OOB"]== min(rf_mtry$err.rate[,"OOB"]))[1]]
+  min.ntree[mtry]=which(rf_mtry$err.rate[,"OOB"]== min(rf_mtry$err.rate[,"OOB"]))[1]
+  oob.err[mtry]=rf_mtry$err.rate[which(rf_mtry$err.rate[,"OOB"]== min(rf_mtry$err.rate[,"OOB"]))[1]]
+}
+matplot(1:8,c(oob.err),pch=19,col="blue",type="b",ylab="oob error")
+best_mtry <- which(oob.err == min(oob.err))
+
+
+# use best mtry
+rf <- randomForest(formula=class ~ .,data=train_set_80, ntree=400, mtry=best_mtry,
+                          importance=TRUE,localImp=TRUE,na.action=na.roughfix,replace=TRUE)
+
+
+# find lowest error rate's iteration
+min.oob.err <- min(rf$err.rate[,"OOB"])
+min.index <- which(rf$err.rate[,"OOB"] == min.oob.err)
+plot(rf)
+min.index # if have mutiple ones, choose the first one
+
+#use best ntree
+rf_best <- randomForest(formula=class ~ .,data=train_set_80, ntree=min.index, mtry=best_mtry,
+                          importance=TRUE,localImp=TRUE,na.action=na.roughfix,replace=TRUE)
+predict_class <- predict(rf_best, newdata = test_set_20)
+rf_predict_prob <- predict(rf_best, newdata = test_set_20, type = "prob")
+acc_rf <- mean(test_set_20$class == predict_class)
+print(c("acc for random forest is", percent(acc_rf, 0.01)))
+(auc_rf <- my.auc(test_set_20$class, predict_prob[, "1"]))
+print(paste("roc score is", round(auc_rf$A, 3)))
+my.rocPlot(test_set_20$class, predict_prob[, "1"], auc_rf, "ROC Curve for Random Forest")
+(table_rf <- table(test_set_20$class, predict_class,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+round(100* table(test_set_20$class, predict_class,dnn=c("% Actual", "% Predicted"))/length(predict_class))
+
+# variable importance
+importance(rf_best)[order(importance(rf_best)[,"MeanDecreaseAccuracy"], decreasing=T),]
+varImpPlot(rf_best, main="Variable Importance in the Random Forest")
+
+
+
+
+
+rf_predict_prob <- rf_predict_prob[,2]
+
+#0.1 cutoff point
+class_pred_rf.1 <- ifelse(rf_predict_prob>0.1,1,0)
+print(paste('acc for rf is:',round(mean(class_pred_rf.1==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_rf.1, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_rf.1))
+
+
+#0.05 cutoff point
+class_pred_rf..5 <- ifelse(rf_predict_prob>0.05,1,0)
+print(paste('acc for rf is:',round(mean(class_pred_rf..5==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_rf..5, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_rf..5))
+
+
+#0.2 cutoff point
+class_pred_rf.2 <- ifelse(rf_predict_prob>0.2,1,0)
+print(paste('acc for rf is:',round(mean(class_pred_rf.2==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_rf.2, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_rf.2))
+
+
+#0.3 cutoff point
+class_pred_rf.3 <- ifelse(rf_predict_prob>0.3,1,0)
+print(paste('acc for rf is:',round(mean(class_pred_rf.3==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_rf.3, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_rf.3))
+
+
+#0.4 cutoff point
+class_pred_rf.4 <- ifelse(rf_predict_prob>0.4,1,0)
+print(paste('acc for rf is:',round(mean(class_pred_lasso.4==test_y_20)*100,2),'%'))
+(tabel.lasso <-table(test_y_20, class_pred_lasso.4, dnn=c("Actual", "Predicted")))
+my.typeErr(table(test_y_20, class_pred_lasso.4))
+
+
+
+
+
+```
+# boosting (not used)
+```{r}
+# bm<- ada(formula=class ~ .,data=train_data,
+#          iter=50,bag.frac=0.5,
+#          control=rpart.control(maxdepth=30, cp=0.01,minsplit=20,xval=10))
+# 
+# mean(bm$fit == bm$actual)
+# predict_class <- predict(bm, newdata = test_data)
+# table(test_data$class, predict_class,dnn=c("Actual", "Predicted"))
+# round(100* table(test_data$class, predict_class,dnn=c("% Actual", "% Predicted"))/length(predict_class))
+# mean(test_data$class == predict_class)
+# varplot(bm)
+```
+
+
+# classification tree
+```{r}
+train_data <- train_set_80
+test_data <- test_set_20
+max_tree <- rpart(class ~ .,
+                  data = train_data,
+                  method = 'class',
+                  parms = list(split = "information"),
+                  control = rpart.control(minsplit = 4, minbucket = 1, cp = 0))
+
+#cross validation, find minimal error - cp(penalty)
+min.xerror <-  which.min(max_tree$cptable[,'xerror'])
+best_cp <- max_tree$cptable[min.xerror,'CP']
+prune_tree <- prune(max_tree, cp = best_cp)
+par(mfrow=c(1,1))
+fancyRpartPlot(prune_tree)
+asRules(prune_tree)
+prune.preds <- predict(prune_tree, newdata = test_data, type = 'class')
+table(test_data$class, prune.preds,dnn=c("Actual", "Predicted"))
+(100*table(test_data$class, prune.preds,dnn=c("% Actual", "% Predicted"))/length(prune.preds))
+
+#prunned blue
+prune.probs <- predict(prune_tree, newdata = test_data)
+prune.roc <- roc(as.numeric(test_data$class), prune.probs[,2])
+plot(prune.roc, col = 'blue', lty = 1)
+
+#max-tree red
+max.probs <- predict(max_tree, newdata = test_data)
+max.roc <- roc(as.numeric(test_data$class), max.probs[,2])
+par(new = T)
+plot(max.roc, col = 'red', lty = 2)
+
+# plot auc
+legend('bottomleft',c('Pruned','Maximal'), lty = c(1,2,3), col = c('blue','red'))
+prune.roc$auc
+max.roc$auc
+```
+
+
+
+
+# stacking
+```{r}
+
+# lr(lasso)
+grid <- 10 ^ seq(10, -10, length=20)
+set.seed(17)
+lasso.st<- cv.glmnet(train_x_40,train_y_40,alpha=1,lambda=grid)
+plot(lasso.st)
+best_lambda <- lasso.st$lambda.1se
+lg_val_prob_st <- predict(lasso.st,s=best_lambda, val_x_40, type = 'response')
+lg_test_prob_st <- predict(lasso.st,s=best_lambda, test_x_20, type = 'response')
+
+
+#random forest
+set.seed(17)
+rf <- randomForest(formula=class ~ .,data=train_set_40, ntree= 97, mtry= 2,
+              importance=TRUE,na.action=na.roughfix,replace=TRUE)
+rf_val_prob_st <- predict(rf, newdata = val_set_40, type = "prob")[,2]
+rf_test_prob_st <- predict(rf, newdata = test_set_20, type = "prob")[,2]
+
+
+# boosting （not used）
+# bm<- ada(formula=class ~ .,data=train_set_40,
+#          iter=50,bag.frac=0.5,
+#          control=rpart.control(maxdepth=20, cp=0.01,minsplit=20,xval=10))
+# boosting_val_prob_st <- predict(bm, newdata = val_set_40, type = "prob")
+# boosting_test_prob_st <- predict(bm, newdata = test_set_20, type = "prob")
+
+
+
+#combine stack training set
+train_stacking <- as.data.frame(cbind(lg_val_prob_st, rf_val_prob_st, as.factor(val_y_40)))
+colnames(train_stacking) <- c("lr", "rf", "class") 
+train_stacking$class <- as.factor(as.numeric(train_stacking$class) - 1)
+
+
+
+#combine stack testing set
+test_stacking <- as.data.frame(cbind(lg_test_prob_st, rf_test_prob_st,  as.factor(test_y_20)))
+colnames(test_stacking) <- c("lr", "rf", 'class')
+test_stacking$class <- as.factor(as.numeric(test_stacking$class) - 1)
+# write_feather(train_stacking,'lr_bm_trained_stacking_training_data.feather')
+# write_feather(test_stacking,'lr_bm_trained_stacking_test_data.feather')
+
+
+
+
+# train final stack model and see accuracy by svm (not used)
+train_stacking$class <- as.numeric(train_stacking$class)-1
+test_stacking$class <- as.numeric(test_stacking$class)-1
+
+svm.fit <- svm(class ~ ., data = train_stacking, kernel = "linear")
+preb_class_st <- predict(svm.fit, test_stacking[,1:2])
+
+(acc_rf <- mean(preb_class_st == (test_set_20$class)))
+print(c("acc for svm is", percent(acc_rf, 0.01)))
+(table_rf <- table(test_set_20$class, preb_class_st,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+round(100* table(test_set_20$class, preb_class_st,dnn=c("% Actual", "% Predicted"))/length(preb_class_st))
+
+
+
+
+
+#tune cost of linear for svm (used)
+tune.out1 <- tune(svm, class ~ ., data = train_stacking, kernel="linear",
+                 ranges=list(cost=c(0.01, 0.1, 0.5, 1, 5)))
+svm.fit1 <- tune.out1$best.model
+preb_class_st <- predict(svm.fit1, test_stacking[,1:2])
+(acc_rf <- mean(preb_class_st == (test_set_20$class)))
+print(c("acc for linear svm is", percent(acc_rf, 0.01)))
+(table_rf <- table(test_set_20$class, preb_class_st,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+round(100* table(test_set_20$class, preb_class_st,dnn=c("% Actual", "% Predicted"))/length(preb_class_st))
+# auc
+svm.fit1 <- svm(class ~ ., data = train_stacking, kernel="linear", cost=0.01,gamma = 0.5,probability = TRUE)
+preb_prob_st1 <- predict(svm.fit1, test_stacking[,1:2],probability = TRUE)
+preb_prob_st1<- attr(preb_prob_st1, "probabilities")[,2]
+auc1<- my.auc(actual = test_stacking$class,pred.prob = preb_prob_st1)
+my.rocPlot(actual =test_stacking$class,preb_prob_st1,auc1,"AUC of linear svm" )
+
+
+
+
+# radial (not used)
+tune.out2 <- tune(svm, class ~ ., data = train_stacking, kernel="radial", 
+                 ranges=list(cost=c(0.01, 0.1, 5),
+                             gamma=c(0.001, 0.01, 5)))
+svm.fit2 <- tune.out2$best.model
+preb_class_st <- predict(svm.fit2, test_stacking[,1:2])
+(acc_rf <- mean(preb_class_st == (test_set_20$class)))
+print(c("acc for radical svm is", percent(acc_rf, 0.01)))
+(table_rf <- table(test_set_20$class, preb_class_st,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+round(100* table(test_set_20$class, preb_class_st,dnn=c("% Actual", "% Predicted"))/length(preb_class_st))
+# auc
+svm.fit2 <- svm(class ~ ., data = train_stacking, kernel="radial", cost=5,gamma = 5,probability = TRUE)
+preb_prob_st2 <- predict(svm.fit2, test_stacking[,1:2],probability = TRUE)
+preb_prob_st2<- attr(preb_prob_st2, "probabilities")[,2]
+auc2 <- my.auc(actual = test_stacking$class,pred.prob = preb_prob_st2)
+my.rocPlot(actual =test_stacking$class,preb_prob_st2,auc2,"AUC of radial svm" )
+
+
+
+
+
+# polynomial (not used)
+tune.out3 <- tune(svm, class ~ ., data = train_stacking, kernel="polynomial", 
+                 ranges=list(cost=c(0.01, 0.05, 0.1, 0.5, 1, 5),
+                             degree=2:4))
+svm.fit3 <- tune.out3$best.model
+preb_class_st <- predict(svm.fit3, test_stacking[,1:2])
+(acc_rf <- mean(preb_class_st == (test_set_20$class)))
+print(c("acc for polynomial svm is", percent(acc_rf, 0.01)))
+(table_rf <- table(test_set_20$class, preb_class_st,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+round(100* table(test_set_20$class, preb_class_st,dnn=c("% Actual", "% Predicted"))/length(preb_class_st))
+# auc
+svm.fit3 <- svm(class ~ ., data = train_stacking, kernel="polynomial", cost=0.01,degree=2,probability = TRUE)
+preb_prob_st3 <- predict(svm.fit3, test_stacking[,1:2],probability = TRUE)
+preb_prob_st3<- attr(preb_prob_st3, "probabilities")[,2]
+auc3 <- my.auc(actual = test_stacking$class,pred.prob = preb_prob_st3)
+my.rocPlot(actual =test_stacking$class,preb_prob_st3,auc3,"AUC of polynomial svm" )
+
+
+
+
+
+
+# log (used)
+set.seed(17)
+log_st <- glm(class ~., data = train_stacking,family = 'binomial')
+glm.probs <- predict(log_st,test_stacking[,1:2], type="response")   
+glm.class <- rep(0, nrow(test_stacking))
+glm.class[glm.probs > 0.5] <- 1
+auc4 <- my.auc(actual = test_stacking$class,pred.prob = glm.probs)
+my.rocPlot(actual =test_stacking$class,glm.probs,auc4,"AUC of log" )
+(acc_rf <- mean(glm.class == (test_stacking$class)))
+print(c("acc for logistic regression is", percent(acc_rf, 0.01)))
+(table_rf <- table(test_set_20$class, glm.class,dnn=c("Actual", "Predicted")))
+my.typeErr(table_rf)
+
+
+
+
+```
+
+# k means clustering
+```{r}
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering algorithms & visualization
+cleaned_km <- scaled_x
+class <- cleaned_data$class
+
+
+
+#try different k for k means
+sum(as.integer(class)-1)/length(class)
+ks <- seq(2,7)
+wss <- c()
+for (k in ks){
+  mykmeans <- kmeans(cleaned_km,k)
+  wss <- c(wss,mykmeans$tot.withinss)
+}
+plot(ks,wss,type = 'b')
+mykmeans200 <- kmeans(cleaned_km,2,nstart = 200)
+labels200 <- mykmeans200$cluster
+labels <- labels200 #add cluster results to dataset
+k3 <- kmeans(cleaned_km, centers = 3, nstart = 20)
+k4 <- kmeans(cleaned_km, centers = 4, nstart = 20)
+k5 <- kmeans(cleaned_km, centers = 5, nstart = 20)
+
+
+
+# plots to compare
+p1 <- fviz_cluster(mykmeans200, geom = "point", data = cleaned_km) + ggtitle("k = 2")
+p2 <- fviz_cluster(k3, geom = "point",  data = cleaned_km) + ggtitle("k = 3")
+p3 <- fviz_cluster(k4, geom = "point",  data = cleaned_km) + ggtitle("k = 4")
+p4 <- fviz_cluster(k5, geom = "point",  data = cleaned_km) + ggtitle("k = 5")
+library(gridExtra)
+grid.arrange( p1,p2, p3, p4, nrow = 2)
+label2 <- mykmeans200$cluster
+label3 <- k3$cluster
+label4 <- k4$cluster
+label5 <- k5$cluster
+
+
+
+# calculat fraud rate for different clusters
+#2
+cluster2_1<- class[label2==1]
+cluster2_2<- class[label2==2]
+cluster2_1_fraud = sum(as.integer(cluster2_1)-1)/length(cluster2_1)
+cluster2_2_fraud = sum(as.integer(cluster2_2)-1)/length(cluster2_2)
+
+#3
+cluster3_1<- class[label3==1]
+cluster3_2<- class[label3==2]
+cluster3_3<- class[label3==3]
+cluster3_1_fraud = sum(as.integer(cluster3_1)-1)/length(cluster3_1)
+cluster3_2_fraud = sum(as.integer(cluster3_2)-1)/length(cluster3_2)
+cluster3_3_fraud = sum(as.integer(cluster3_3)-1)/length(cluster3_3)
+
+
+# 4
+cluster4_1<- class[label4==1]
+cluster4_2<- class[label4==2]
+cluster4_3<- class[label4==3]
+cluster4_4<- class[label4==4]
+cluster4_1_fraud = sum(as.integer(cluster4_1)-1)/length(cluster4_1)
+cluster4_2_fraud = sum(as.integer(cluster4_2)-1)/length(cluster4_2)
+cluster4_3_fraud = sum(as.integer(cluster4_3)-1)/length(cluster4_3)
+cluster4_4_fraud = sum(as.integer(cluster4_4)-1)/length(cluster4_4)
+
+
+# 5
+cluster5_1<- class[label5==1]
+cluster5_2<- class[label5==2]
+cluster5_3<- class[label5==3]
+cluster5_4<- class[label5==4]
+cluster5_5<- class[label5==5]
+cluster5_1_fraud = sum(as.integer(cluster5_1)-1)/length(cluster5_1)
+cluster5_2_fraud = sum(as.integer(cluster5_2)-1)/length(cluster5_2)
+cluster5_3_fraud = sum(as.integer(cluster5_3)-1)/length(cluster5_3)
+cluster5_4_fraud = sum(as.integer(cluster5_4)-1)/length(cluster5_4)
+cluster5_5_fraud = sum(as.integer(cluster5_5)-1)/length(cluster5_5)
+
+
+
+
+```
+
+
+########################## experiment on loss funciton done here (not used) ##########################
+
+
+
+# customized logistic regression (preprocess data)
+```{r}
+set.seed(5072)
+
+
+
+
+train <- sample(1:nrow(data), nrow(data)*0.7)
+test <- (-train)
+dim(X)
+str(X)
+
+class_data <- data_used$class
+X_lr <- data.frame(X,class=class_data)
+head(X_lr)
+str(X_lr)
+write_feather(X_lr, 'data_lr.feather')
+X_lr <- read_feather('data_lr.feather')
+traindata <- X_lr[train,]
+testdata <- X_lr[test,]
+train.X <- X[train,]
+train.y <- data_used$class[train]
+test.X <- X[test,]
+test.y <- data_used$class[test]
+```
+
+
+# customized logistic regression (default loss function )
+```{r}
+traindata$class <- as.factor(traindata$class)
+testdata$class <- as.factor(testdata$class)
+glm.fit <- glm(class~.,data=traindata, family=binomial)
+glm.probs <- predict(glm.fit, type="response")  
+pred_class_lr <- ifelse(glm.probs>0.5,1,0)
+mean(pred_class_lr==traindata$class)
+pred_test_prob <- predict(glm.fit,testdata,type = 'response')
+pred_class_test <- ifelse(pred_test_prob>0.5,1,0)
+mean(pred_class_test==testdata$class)
+table(pred_class_test,testdata$class)
+type.err(table(pred_class_test,testdata$class))
+
+length(pred_class_test)
+dim(test.X)
+length(pred_test_prob)
+grid <- 10 ^ seq(10, -2, length=100)
+cv.out <- cv.glmnet(train.X, train.y, alpha=0,lambda=grid)
+plot(cv.out)
+lam <- cv.out$lambda.1se
+
+fit <- cv.out$glmnet.fit
+summary(fit)
+ridge.pred <- predict(fit, 
+                      s=lam,   
+                      newx=test.X)
+pred_class_glm <- ifelse(ridge.pred>0.5,1,0)
+mean(pred_class_glm==test.y)
+sum(ridge.pred>0.3 & ridge.pred<0.7)
+table(pred_class_glm,test.y)
+type.err(table(pred_class_glm,test.y))
+#cv.out$lambda.min
+```
+
+
+```{r}
+
+
+
+dt <- mx.symbol.Variable("data")
+label <- mx.symbol.Variable("label")
+fc1 <- mx.symbol.FullyConnected(dt, num_hidden = 1, name = "fc1")
+lreg <- mx.symbol.LogisticRegressionOutput(fc1, name = "lreg")
+
+mx.set.seed(0)
+model <- mx.model.FeedForward.create(lreg, X = train.X, y = train.y,
+                                     ctx = mx.cpu(),
+                                     num.round = 5,
+                                     array.batch.size = 256,
+                                     optimizer = "rmsprop",
+                                     verbose = TRUE,
+                                     array.layout = "rowmajor",
+                                     batch.end.callback = NULL,
+                                     epoch.end.callback = NULL,
+                                     wd = lam
+                                     )
+
+#train acc
+pred_train <- t(predict(model,train.X))
+pred_train_class <- ifelse(pred_train>0.5,1,0)
+mean(pred_train_class==train.y)
+pred <- t(predict(model,test.X))
+pred_plt <- data.frame(pred)
+ggplot(pred_plt, aes(x = pred)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+pred_class <- ifelse(pred>0.5,1,0)
+mean(pred_class==test.y)
+sum(pred_class==1)
+(table_ori <- table(pred_class,test.y))
+sum(pred>0.3 & pred<0.7)
+roc.area(as.numeric(test.y), as.numeric(pred))
+roc.plot(as.numeric(test.y), as.numeric(pred))
+type.err(table_ori)
+all.ori <- cbind(pred,pred_class,test.y)
+all.ori<- data.frame(all.ori)
+names(all.ori) <- c('prob','class','y')
+type2.prob.ori <- all.ori$prob[all.ori$class==0 & all.ori$y==1]
+ggplot(data.frame(type2.prob.ori), aes(x = type2.prob.ori)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+```
+
+# customized logistic regression (customized loss function )
+```{r}
+sigOut <- mx.symbol.Activation(fc1, act_type = "sigmoid", name = "sigOut")
+y_hat <- mx.symbol.Reshape(sigOut,shape=0)
+a_value <- 0.25
+g_value <- 5
+entropy1 <- label*mx.symbol.log(y_hat)
+entropy2 <- (1-label)*mx.symbol.log(1-y_hat)
+
+
+#penalize more
+loss <- mx.symbol.MakeLoss(mx.symbol.negative(((a_value*(1-y_hat)^g_value))*entropy1 + (((1-a_value)*(y_hat)^g_value))*entropy2),name="loss")
+
+#only penalize imbalanced
+loss <- mx.symbol.MakeLoss(mx.symbol.negative(a_value*entropy1 + (1-a_value)*entropy2),name="loss")
+
+#original loss function
+loss <- mx.symbol.MakeLoss(mx.symbol.negative(entropy1 + entropy2),name="loss")
+
+
+
+mx.set.seed(0)
+modelCustom <- mx.model.FeedForward.create(loss, X = train.X, y = train.y,
+                                     ctx = mx.cpu(),
+                                     num.round = 5,
+                                     array.batch.size = 256,
+                                     optimizer = "rmsprop",
+                                     verbose = TRUE,
+                                     array.layout = "rowmajor",
+                                     batch.end.callback = NULL,
+                                     epoch.end.callback = NULL,
+                                     wd = lam
+                                     )
+                
+
+uinternals = internals(modelCustom$symbol)
+fc_symbol = internals[[match("sigOut_output", outputs(internals))]]
+modelCustom2 <- list(symbol = fc_symbol,
+arg.params = modelCustom$arg.params,
+aux.params = modelCustom$aux.params)
+class(modelCustom2) <- "MXFeedForwardModel"
+
+predCustom <- t(predict(modelCustom2,test.X))   
+
+#pred_custom <- predict(modelCustom,test.X)
+pred_custom <- data.frame(predCustom)
+ggplot(pred_custom, aes(x = predCustom)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+pred_class_custom <- ifelse(pred_custom>0.5,1,0)
+sum(pred_class_custom==1)
+sum(test.y==1)
+dim(pred_custom)
+mean(pred_class_custom==test.y)
+(table.cut<-table(pred_class_custom,test.y))
+all.cust <- cbind(predCustom,pred_class_custom,test.y)
+all.cust<- data.frame(all.cust)
+names(all.cust) <- c('prob','class','y')
+type2.prob.cust <- all.cust$prob[all.cust$class==0 & all.cust$y==1]
+ggplot(data.frame(type2.prob.cust), aes(x = type2.prob.cust)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+
+
+
+roc.area(as.numeric(test.y), as.numeric(pred_custom[[1]]))
+roc.plot(as.numeric(test.y), as.numeric(pred_custom[[1]]))
+type.err(table.cut)
+
+
+# explore type2
+all.cust <- data.frame(cbind(pred_custom,pred_class_custom,test.y))
+names(all.cust) <- c('prob','class','y')
+type2.prob <- all.cust$prob[all.cust$class==0 & all.cust$y==1]
+ggplot(data.frame(type2.prob), aes(x = type2.prob)) +
+  geom_histogram(binwidth = 0.1, fill = "lightblue", colour = "black")
+```
+
+
+
